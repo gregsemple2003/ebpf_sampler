@@ -99,11 +99,11 @@ static void handle_event(void* ctx, int cpu, void* data, uint32_t data_sz) {
 
     // BPF program now filters, so PID should always match target_pid
     // Add a check just in case, but log it as an unexpected error if it fails
-    if (e->pid != target_pid) {
-        fprintf(stderr, "\n[Callback] UNEXPECTED ERROR: Received event for wrong PID %u (target %d)\n",
-            e->pid, target_pid);
-        return; // Don't process unexpected PIDs
-    }
+    // TODO gsemple: the tgid received from the kernel != getpid(), likely because its using the process leader PID (or something, we never really figured it out)
+    //if (e->pid != target_pid) {
+    //    fprintf(stderr, "\n[Callback] UNEXPECTED ERROR: Received event for wrong PID %u (target %d)\n", e->pid, target_pid);
+    //    return; // Don't process unexpected PIDs
+    //}
 
     // Lookup stack trace
     if (stack_traces_fd < 0) {
@@ -192,7 +192,22 @@ int main(int argc, char** argv) {
         if (stat("/proc/self/ns/pid", &st) == 0) {
             skel->bss->target_pidns_inum = static_cast<__u32>(st.st_ino);
         }
-        skel->bss->target_tgid_host = static_cast<__u32>(getpid());  // host TGID
+        auto host_tgid = []() -> __u32 {
+            FILE* fp = fopen("/proc/self/status", "r");
+            char line[256];
+            while (fp && fgets(line, sizeof(line), fp)) {
+                if (strncmp(line, "NSpid:", 6) == 0) {
+                    fprintf(stderr, "DEBUG NSpid line = %s", line);
+
+                    /* line looks like:  NSpid:\t62620\t62120\n
+                        first number = host pid/tgid              */
+                    return static_cast<__u32>(strtoul(line + 6, nullptr, 10));
+                }
+            }
+            return static_cast<__u32>(getpid());   // fallback: single namespace
+        }();
+
+        skel->bss->target_tgid_host = host_tgid;
 
         printf("DEBUG: setting target_pidns_inum=%d, target_tgid_host=%d\n", skel->bss->target_pidns_inum, skel->bss->target_tgid_host);
     }
@@ -263,7 +278,7 @@ int main(int argc, char** argv) {
         attr.exclude_kernel = 1;
         attr.disabled = 1; // OPEN DISABLED
 
-        pmu_fds[cpu] = perf_event_open_syscall(&attr, /*pid=*/-1, cpu, -1, 0);
+        pmu_fds[cpu] = perf_event_open_syscall(&attr, /*pid=*/getpid(), cpu, -1, 0);
         if (pmu_fds[cpu] < 0) {
             fprintf(stderr, "ERROR: Failed to open system-wide perf event on CPU %d: %s\n", cpu, strerror(errno));
             err = -errno;

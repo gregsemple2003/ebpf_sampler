@@ -52,7 +52,7 @@ int do_stack_sample(struct bpf_perf_event_data* ctx) {
         pid_ns_for_children,
         ns.inum);
 
-    /* reject: wrong namespace */
+    // reject: wrong namespace
     if (curr_inum != target_pidns_inum)
     {
         char comm[16] = {};
@@ -61,7 +61,7 @@ int do_stack_sample(struct bpf_perf_event_data* ctx) {
         return 0;
     }
 
-    ///* reject: wrong TGID even inside that namespace */
+    //// reject: wrong TGID even inside that namespace
     u32 tgid = bpf_get_current_pid_tgid() >> 32;
     //if (tgid != target_tgid_host)
     //{

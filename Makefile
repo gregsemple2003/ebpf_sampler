@@ -18,7 +18,7 @@ LIBBPF_INCLUDE := /usr/include
 # Add -I. for local headers (like workload.hpp, *.skel.h)
 # Add -pthread for std::thread
 COMMON_FLAGS := -Wall -Wextra -O2 -I.
-CXXFLAGS := -std=c++17 $(COMMON_FLAGS) -pthread
+CXXFLAGS := -std=c++17 $(COMMON_FLAGS) -pthread -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls
 # CFLAGS := $(COMMON_FLAGS) -pthread # C flags also need includes and pthread if using atomics/threads directly <-- USE CXXFLAGS FOR MAIN FILE
 CFLAGS_FOR_MAIN := $(CXXFLAGS) # Use C++ flags for the main file since it's compiled with g++
 CLANG_BPF_FLAGS := -g -O2 -target bpf -Wall -Werror
