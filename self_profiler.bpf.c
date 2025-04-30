@@ -6,11 +6,6 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
-// --- Target PID global variable ---
-// Value will be set by user-space via skeleton *before* loading.
-volatile __u32 target_pidns_inum = 0;
-volatile __u32 target_tgid_host = 0;      // host-namespace TGID
-
 // ------------------------------------------------------------------
 // BEGIN CHANGED CODE
 //
