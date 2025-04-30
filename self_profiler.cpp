@@ -1,4 +1,4 @@
-﻿// self_profiler.c (Implementing skeleton variable and system-wide events with verbose error logging)
+﻿// self_profiler.cpp (Implementing skeleton variable and system-wide events with verbose error logging)
 
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 
@@ -35,19 +35,24 @@ struct pid_namespace;  // forward-declare; no header needed
 
 // Workload Header
 #include "workload.hpp"
+#include "dwarf_unwind.hpp"
 
 // --- BPF Data Structures (Must match BPF side) ---
-struct event {
-    uint32_t stack_id;
-    uint32_t pid; // TGID
-    uint32_t tid; // PID
+struct stack_snapshot_event {
+    uint32_t pid;
+    uint32_t tid;
+    uint32_t size;
+    int32_t  err;          //  <── NEW
+    uint64_t rsp;
+    uint64_t rbp;
+    uint8_t  truncated;
+    uint8_t  _pad[7];
+    uint8_t  data[8192];    /* 8 KiB */
 };
-#define MAX_STACK_DEPTH 127
 
 // --- Global Variables ---
 static std::atomic<bool> keep_running(true);
 static volatile bool exiting = false;
-static int stack_traces_fd = -1;
 static pid_t target_pid = 0;
 
 // --- Helper: Libbpf Print Function ---
@@ -85,59 +90,25 @@ static long perf_event_open_syscall(struct perf_event_attr* hw_event, pid_t pid,
 // --- Perf Buffer Callbacks (Global Functions) ---
 static void handle_event(void* ctx, int cpu, void* data, uint32_t data_sz) {
     (void)ctx; (void)cpu;
-    static uint64_t stack_addrs[MAX_STACK_DEPTH];
+    const stack_snapshot_event* e = static_cast<const stack_snapshot_event*>(data);
+    if (data_sz < sizeof(stack_snapshot_event)) return;
 
-    fprintf(stderr, "\n[Callback] handle_event called\n");
-
-    if (data_sz != sizeof(struct event)) {
-        fprintf(stderr, "\n[Callback] ERROR: Received event data with unexpected size %u (expected: %zu)\n",
-            data_sz, sizeof(struct event));
-        return; // Exit callback on error
+    if (e->size == 0) {                       // truly empty snapshot
+        printf("\n--- Sample --- PID:%u TID:%u READ_ERR:%d\n",
+               e->pid, e->tid, e->err);
+        return;
     }
 
-    const struct event* e = (const struct event*)data;
+    std::vector<uint64_t> frames;
+    bool truncated = false;
+    UnwindRbpChain(e->data, e->size, e->rsp, e->rbp, frames, truncated);
 
-    // BPF program now filters, so PID should always match target_pid
-    // Add a check just in case, but log it as an unexpected error if it fails
-    // TODO gsemple: the tgid received from the kernel != getpid(), likely because its using the process leader PID (or something, we never really figured it out)
-    //if (e->pid != target_pid) {
-    //    fprintf(stderr, "\n[Callback] UNEXPECTED ERROR: Received event for wrong PID %u (target %d)\n", e->pid, target_pid);
-    //    return; // Don't process unexpected PIDs
-    //}
+    printf("\n--- Sample --- PID:%u TID:%u Frames:%zu%s\n",
+           e->pid, e->tid, frames.size(),
+           (e->truncated || truncated) ? " (TRUNCATED)" : "");
 
-    // Lookup stack trace
-    if (stack_traces_fd < 0) {
-        fprintf(stderr, "\n[Callback] ERROR: stack_traces map FD is not valid (%d)!\n", stack_traces_fd);
-        return; // Exit callback on error
-    }
-    memset(stack_addrs, 0, sizeof(stack_addrs));
-    int ret = bpf_map_lookup_elem(stack_traces_fd, &e->stack_id, stack_addrs);
-    if (ret != 0) {
-        // Log ENOENT as info, other errors as warning/error
-        if (errno == ENOENT) {
-            fprintf(stderr, "\n[Callback] INFO: Stack ID %u not found (ENOENT) for PID %u.\n", e->stack_id, e->pid);
-        }
-        else {
-            fprintf(stderr, "\n[Callback] ERROR: Failed to lookup stack_id %u for PID %u: %s\n",
-                e->stack_id, e->pid, strerror(errno));
-        }
-        return; // Exit callback on error
-    }
-
-    // Print Sample
-    printf("\n--- Sample --- PID: %u TID: %u StackID: %u ---\n", e->pid, e->tid, e->stack_id);
-    printf("  User Stack Trace:\n");
-    int count = 0;
-    for (int i = 0; i < MAX_STACK_DEPTH; ++i) {
-        if (stack_addrs[i] == 0) break;
-        if (stack_addrs[i] > 0x7FFFFFFFFFFFFFFFULL) continue;
-        printf("    #%d: 0x%" PRIx64 "\n", count++, stack_addrs[i]);
-    }
-    if (count == 0) { // Log if lookup succeeded but stack was empty/invalid
-        fprintf(stderr, "    INFO: No valid stack addresses found for stack_id %u\n", e->stack_id);
-    }
-    fflush(stdout); // Ensure printf is flushed
-    fflush(stderr); // Ensure fprintf is flushed
+    for (size_t i = 0; i < frames.size(); ++i)
+        printf("    #%zu 0x%llx\n", i, (unsigned long long)frames[i]);
 }
 
 static void handle_lost_events(void* ctx, int cpu, long long unsigned int lost_cnt) {
@@ -164,7 +135,6 @@ int main(int argc, char** argv) {
     std::thread worker_thread;
     std::thread main_workload_thread;
     int events_map_fd = -1;
-
 
     target_pid = getpid();
     printf("Self Profiler started. PID: %d\n", target_pid);
@@ -221,24 +191,23 @@ int main(int argc, char** argv) {
     }
     printf("BPF object loaded.\n");
 
-    // --- Get Map FDs (Events and Stack Traces) ---
+    // --- Get Map FDs (Events) ---
     printf("Finding map FDs...\n");
     events_map_fd = bpf_map__fd(skel->maps.events);
-    stack_traces_fd = bpf_map__fd(skel->maps.stack_traces);
-    if (events_map_fd < 0 || stack_traces_fd < 0) {
-        fprintf(stderr, "ERROR: Failed to get map FDs: events=%d, stack_traces=%d (%s)\n",
-            events_map_fd, stack_traces_fd, strerror(errno));
+    if (events_map_fd < 0) {
+        fprintf(stderr, "ERROR: Failed to get events map FD: %d (%s)\n",
+            events_map_fd, strerror(errno));
         err = -errno;
         goto cleanup;
     }
-    printf("Found map FDs: events=%d, stack_traces=%d\n", events_map_fd, stack_traces_fd);
+    printf("Found events map FD: %d\n", events_map_fd);
 
     // --- Create Perf Buffer ---
     printf("Setting up perf buffer...\n");
     memset(&pb_opts, 0, sizeof(pb_opts));
     pb_opts.sample_cb = handle_event;
     pb_opts.lost_cb = handle_lost_events;
-    pb = perf_buffer__new(events_map_fd, 8 /* page count */, &pb_opts);
+    pb = perf_buffer__new(events_map_fd, 256 /* page count */, &pb_opts);
     err = libbpf_get_error(pb);
     if (err) {
         pb = NULL;
@@ -247,7 +216,6 @@ int main(int argc, char** argv) {
         goto cleanup;
     }
     printf("Perf buffer ready - map populated.\n");
-
 
     // --- Open/Attach/Enable SYSTEM-WIDE Sampling Perf Events ---
     printf("Opening/Attaching/Enabling sampling perf events (system-wide)...\n");
@@ -302,12 +270,10 @@ int main(int argc, char** argv) {
     }
     printf("Sampling perf events opened, attached, and enabled.\n");
 
-
     // --- Start Workload Threads ---
     printf("Starting workload threads...\n");
     worker_thread = std::thread(run_workload, std::ref(keep_running));
     main_workload_thread = std::thread(run_workload, std::ref(keep_running));
-
 
     // --- Main Event Loop ---
     printf("Polling perf buffer... Press Ctrl+C to stop.\n");
@@ -340,7 +306,6 @@ int main(int argc, char** argv) {
     printf("Main workload thread joined.\n");
     if (worker_thread.joinable()) { worker_thread.join(); }
     printf("Worker thread joined.\n");
-
 
 cleanup:
     fprintf(stderr, "\nExiting... Performing cleanup.\n"); // Use stderr for exit messages

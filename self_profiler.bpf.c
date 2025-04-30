@@ -11,24 +11,42 @@
 volatile __u32 target_pidns_inum = 0;
 volatile __u32 target_tgid_host = 0;      // host-namespace TGID
 
-// Max stack depth to capture
-#define MAX_STACK_DEPTH 127
+// ------------------------------------------------------------------
+// BEGIN CHANGED CODE
+//
+// 1.  Helpers ───────────────────────────────────────────────────────
+#ifndef PT_REGS_FP          /* new kernels spell it FP, older BP   */
+# define PT_REGS_FP PT_REGS_BP
+#endif
 
-// Map to store the stack traces
-struct {
-    __uint(type, BPF_MAP_TYPE_STACK_TRACE);
-    __uint(key_size, sizeof(u32));
-    __uint(value_size, MAX_STACK_DEPTH * sizeof(u64));
-    __uint(max_entries, 10240);
-} stack_traces SEC(".maps");
+#define MAX_STACK_SNAPSHOT 8192
+#define CHUNK 256
+#define MAX_CHUNKS   (MAX_STACK_SNAPSHOT / CHUNK)
 
-// Map to send events to user space
-struct event {
-    u32 stack_id;
-    u32 pid; // TGID
-    u32 tid; // PID
+// helpers + struct -------------------------------------------------
+struct stack_snapshot_event {
+    __u32 pid;
+    __u32 tid;
+    __u32 size;        /* bytes actually copied                    */
+    __s32 err;         /* bpf_probe_read_user() return value       */
+    __u64 rsp;
+    __u64 rbp;
+    __u8  truncated;
+    __u8  _pad[7];     /* keep 8-byte alignment, header = 40 B     */
+    __u8  data[MAX_STACK_SNAPSHOT];
 };
 
+/* Per-CPU scratch slot big enough for one snapshot.
+ * We fill it, then dump through perf_event_output. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct stack_snapshot_event);
+} tmp_snapshot SEC(".maps");
+// END CHANGED CODE
+
+// Map to send events to user space
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(u32));
@@ -44,62 +62,55 @@ struct {
 //}
 
 SEC("perf_event")
-int do_stack_sample(struct bpf_perf_event_data* ctx) {
-    struct task_struct* task = (struct task_struct*)bpf_get_current_task();
-
-    __u32 curr_inum = BPF_CORE_READ(task,
-        nsproxy,
-        pid_ns_for_children,
-        ns.inum);
-
-    // reject: wrong namespace
-    if (curr_inum != target_pidns_inum)
-    {
-        char comm[16] = {};
-        bpf_get_current_comm(comm, sizeof(comm));
-        bpf_printk("rejected sample, curr_inum=%d, target_pidns_inum=%d, comm=%s\n", curr_inum, target_pidns_inum, comm);
+int do_stack_sample(struct bpf_perf_event_data *ctx)
+{
+    __u32 zero = 0;
+    struct stack_snapshot_event *ev = bpf_map_lookup_elem(&tmp_snapshot, &zero);
+    if (!ev)                      /* should never happen            */
         return 0;
+
+    /* fill header -------------------------------------------------- */
+    __u64 id  = bpf_get_current_pid_tgid();
+    __u32 tid = id;
+    __u32 tgid = id >> 32;
+
+    ev->pid = tgid;
+    ev->tid = tid;
+    ev->rsp = PT_REGS_SP(&ctx->regs);   /* need address, not value   */
+    ev->rbp = PT_REGS_FP(&ctx->regs);
+    ev->truncated = 0;
+
+    ev->err  = 0;        /* clear stale values from previous use */
+    ev->size = 0;
+
+    /* DEBUG ─ print the user-mode RSP/RBP we'll try to copy from */
+    bpf_printk("sample: rsp=%llx rbp=%llx\n", ev->rsp, ev->rbp);
+
+    /* copy loop ----------------------------------------------------- */
+    __u32 copied = 0;
+
+#pragma unroll
+    for (int i = 0; i < MAX_CHUNKS; i++) {
+        if (copied > MAX_STACK_SNAPSHOT - CHUNK)
+            break;
+
+        int ret = bpf_probe_read_user(ev->data + copied,
+                                      CHUNK,
+                                      (void *)(ev->rsp + copied));
+        if (ret) {
+            ev->truncated = 1;
+            if (copied == 0)
+                ev->err = ret;
+            break;
+        }
+        copied += CHUNK;
     }
 
-    //// reject: wrong TGID even inside that namespace
-    u32 tgid = bpf_get_current_pid_tgid() >> 32;
-    //if (tgid != target_tgid_host)
-    //{
-    //    char comm[16] = {};
-    //    bpf_get_current_comm(comm, sizeof(comm));
-    //    bpf_printk("rejected sample, tgid=%d, target_tgid_host=%d, comm=%s\n", tgid, target_tgid_host, comm);
-    //    return 0;
-    //}
+    ev->size = copied;
 
-    // TODO gsemple: remove this, unreliable and weird
-    u64 id = bpf_get_current_pid_tgid();
-    u32 tid = (u32)id;
-
-    //struct task_struct* task = (struct task_struct*)bpf_get_current_task();
-    //u64 pid_ns_ptr = (u64)BPF_CORE_READ(task, nsproxy, pid_ns_for_children);
-
-    ///* first printk: TGID, TID, pid-namespace pointer  → 3 args */
-    //bpf_printk("hit: tg=%u ti=%u ns=%llx\n", tgid, tid, pid_ns_ptr);
-
-    /* second printk: task name  → 1 arg */
-    //bpf_printk("comm=%s\n", comm);
-
-    bpf_printk("accepted sample\n");
-
-    // If we get here, the TGID matches the target
-    s32 stack_id = bpf_get_stackid(ctx, &stack_traces, BPF_F_USER_STACK);
-    bpf_printk("stackid ret=%d, err=%d\n", stack_id, stack_id);
-    if (stack_id < 0) {
-        return 0;
-    }
-
-    struct event event_data = {};
-    event_data.stack_id = (u32)stack_id;
-    event_data.pid = tgid;
-    event_data.tid = tid;
-
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event_data, sizeof(event_data));
-
+    /* ship it out -------------------------------------------------- */
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
+                          ev, sizeof(*ev));
     return 0;
 }
 

@@ -2,8 +2,7 @@
 # Use g++ for linking C and C++ code together
 LD := g++
 CXX := g++
-# CC := gcc # Use gcc for the main C file now <-- NO, main uses C++ features
-CC := g++  # *** USE g++ for main file now ***
+CC := g++  # Use g++ for all files now
 CLANG := clang # Use clang for BPF compilation
 BPFTOOL := bpftool
 
@@ -19,20 +18,16 @@ LIBBPF_INCLUDE := /usr/include
 # Add -pthread for std::thread
 COMMON_FLAGS := -Wall -Wextra -O2 -I.
 CXXFLAGS := -std=c++17 $(COMMON_FLAGS) -pthread -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls
-# CFLAGS := $(COMMON_FLAGS) -pthread # C flags also need includes and pthread if using atomics/threads directly <-- USE CXXFLAGS FOR MAIN FILE
-CFLAGS_FOR_MAIN := $(CXXFLAGS) # Use C++ flags for the main file since it's compiled with g++
-CLANG_BPF_FLAGS := -g -O2 -target bpf -Wall -Werror
+CLANG_BPF_FLAGS := -g -O2 -target bpf -Wall -Werror -D__TARGET_ARCH_x86
 # Linker flags
 LDFLAGS := -lelf -lz -lbpf
 
 # Source files
-C_SRC := self_profiler.c   # Main file (compiled as C++)
-CXX_SRC := workload.cpp    # Workload is C++
-BPF_C_SRC := self_profiler.bpf.c # BPF file (matches main file name)
+CXX_SRCS := self_profiler.cpp workload.cpp dwarf_unwind.cpp   # All C++ files
+BPF_C_SRC := self_profiler.bpf.c # BPF file
 
 # Object files
-C_OBJ := $(patsubst %.c,%.o,$(C_SRC))
-CXX_OBJ := $(patsubst %.cpp,%.o,$(CXX_SRC))
+CXX_OBJS := $(patsubst %.cpp,%.o,$(CXX_SRCS))
 BPF_OBJ := $(patsubst %.bpf.c,%.bpf.o,$(BPF_C_SRC))
 
 # Generated Skeleton Header
@@ -58,8 +53,8 @@ $(BPF_SKEL): $(BPF_OBJ)
 	@echo "Generated BPF skeleton header: $@"
 
 # --- Link the final application ---
-$(APP_NAME): $(C_OBJ) $(CXX_OBJ) | $(BPF_OBJ) $(BPF_SKEL)
-	$(LD) $(CXXFLAGS) $(C_OBJ) $(CXX_OBJ) -o $@ $(LDFLAGS)
+$(APP_NAME): $(CXX_OBJS) | $(BPF_OBJ) $(BPF_SKEL)
+	$(LD) $(CXXFLAGS) $(CXX_OBJS) -o $@ $(LDFLAGS)
 	@echo "Linked executable: $@"
 
 # --- Compile BPF code ---
@@ -67,18 +62,19 @@ $(BPF_OBJ): $(BPF_C_SRC) vmlinux.h
 	$(CLANG) $(CLANG_BPF_FLAGS) -c $< -o $@
 	@echo "Compiled BPF object: $@"
 
-# --- Compile "C" main file (using g++) ---
-# Depends on the generated skeleton header AND the C source file
-$(C_OBJ): $(C_SRC) workload.hpp $(BPF_SKEL) vmlinux.h
-	$(CC) $(CFLAGS_FOR_MAIN) -c $< -o $@ # Use g++ and C++ flags
+# --- Compile C++ files ---
+self_profiler.o: self_profiler.cpp workload.hpp dwarf_unwind.hpp $(BPF_SKEL) vmlinux.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# --- Compile C++ workload file ---
-$(CXX_OBJ): $(CXX_SRC) workload.hpp
+workload.o: workload.cpp workload.hpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+dwarf_unwind.o: dwarf_unwind.cpp dwarf_unwind.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # --- Clean target ---
 clean:
-	rm -f $(APP_NAME) $(C_OBJ) $(CXX_OBJ) $(BPF_OBJ) $(BPF_SKEL) vmlinux.h core.* *~
+	rm -f $(APP_NAME) $(CXX_OBJS) $(BPF_OBJ) $(BPF_SKEL) vmlinux.h core.* *~
 	@echo "Cleaned build files."
 
 .PHONY: all clean generate_headers
