@@ -172,32 +172,6 @@ int main(int argc, char** argv) {
     }
     printf("Skeleton opened.\n");
 
-    printf("Setting target PID in skeleton...\n"); // must happen before load
-    {
-        struct stat st;
-        if (stat("/proc/self/ns/pid", &st) == 0) {
-            skel->bss->target_pidns_inum = static_cast<__u32>(st.st_ino);
-        }
-        auto host_tgid = []() -> __u32 {
-            FILE* fp = fopen("/proc/self/status", "r");
-            char line[256];
-            while (fp && fgets(line, sizeof(line), fp)) {
-                if (strncmp(line, "NSpid:", 6) == 0) {
-                    fprintf(stderr, "DEBUG NSpid line = %s", line);
-
-                    /* line looks like:  NSpid:\t62620\t62120\n
-                        first number = host pid/tgid              */
-                    return static_cast<__u32>(strtoul(line + 6, nullptr, 10));
-                }
-            }
-            return static_cast<__u32>(getpid());   // fallback: single namespace
-        }();
-
-        skel->bss->target_tgid_host = host_tgid;
-
-        printf("DEBUG: setting target_pidns_inum=%d, target_tgid_host=%d\n", skel->bss->target_pidns_inum, skel->bss->target_tgid_host);
-    }
-
     // --- Load BPF Object ---
     printf("Loading BPF object...\n");
     err = self_profiler_bpf__load(skel.get());
