@@ -12,8 +12,8 @@
 #endif
 // END CHANGED CODE
 
-// Very small helper: walk an RBP-framed stack living in |snapshot|.
-bool UnwindDwarf(const uint8_t* snapshot,
+// Simple helper: walk an RBP-framed stack living in |snapshot|.
+bool UnwindStack(const uint8_t* snapshot,
                  uint32_t       snapshotSize,
                  const regs_x86_64& regs,
                  std::vector<uint64_t>& outFrames,

@@ -22,6 +22,10 @@ CLANG_BPF_FLAGS := -g -O2 -target bpf -Wall -Werror -D__TARGET_ARCH_x86
 # Linker flags
 LDFLAGS := -Wl,-Bstatic -L/usr/src/libbpf/src -lbpf -Wl,-Bdynamic -lelf -lz -pthread -lunwind -lunwind-x86_64
 
+# Un-optimised, full-symbol flags (-O0 + -g3)
+CXXDEBUGFLAGS = $(filter-out -O%,$(CXXFLAGS)) \
+                -O0 -g3 -fno-omit-frame-pointer -fno-optimize-sibling-calls
+
 # Source files
 CXX_SRCS := self_profiler.cpp workload.cpp dwarf_unwind.cpp   # All C++ files
 BPF_C_SRC := self_profiler.bpf.c # BPF file
@@ -76,5 +80,10 @@ dwarf_unwind.o: dwarf_unwind.cpp dwarf_unwind.hpp
 clean:
 	rm -f $(APP_NAME) $(CXX_OBJS) $(BPF_OBJ) $(BPF_SKEL) vmlinux.h core.* *~
 	@echo "Cleaned build files."
+
+# Build everything from scratch with the debug flags
+.PHONY: debug
+debug: clean
+	$(MAKE) CXXFLAGS="$(CXXDEBUGFLAGS)" all
 
 .PHONY: all clean generate_headers

@@ -8,7 +8,7 @@
 #endif
 // END CHANGED CODE
 
-bool UnwindDwarf(const uint8_t* snap,
+bool UnwindStack(const uint8_t* snap,
                  uint32_t       snapSz,
                  const regs_x86_64& regs,
                  std::vector<uint64_t>& frames,

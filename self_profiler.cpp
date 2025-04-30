@@ -98,7 +98,7 @@ static int handle_event(void* ctx, void* data, size_t size) {
 
     std::vector<uint64_t> frames;
     bool truncated = e->flags & STACK_TRUNCATED;
-    UnwindDwarf(e->stack, e->stack_size, e->regs, frames, truncated);
+    UnwindStack(e->stack, e->stack_size, e->regs, frames, truncated);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
