@@ -38,16 +38,15 @@ struct pid_namespace;  // forward-declare; no header needed
 #include "dwarf_unwind.hpp"
 
 // --- BPF Data Structures (Must match BPF side) ---
-struct stack_snapshot_event {
-    uint32_t pid;
-    uint32_t tid;
-    uint32_t size;
-    int32_t  err;          //  <── NEW
-    uint64_t rsp;
-    uint64_t rbp;
-    uint8_t  truncated;
-    uint8_t  _pad[7];
-    uint8_t  data[8192];    /* 8 KiB */
+struct stack_sample_event {
+    uint64_t tgid;
+    uint64_t pid;
+    uint64_t time_ns;
+    uint64_t sp_remote;
+    uint64_t bp_remote;      // NEW: frame-pointer (RBP) at sample
+    uint32_t stack_size;
+    uint32_t flags;
+    char stack[8192];
 };
 
 // --- Global Variables ---
@@ -87,48 +86,52 @@ static long perf_event_open_syscall(struct perf_event_attr* hw_event, pid_t pid,
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
-// --- Perf Buffer Callbacks (Global Functions) ---
-static void handle_event(void* ctx, int cpu, void* data, uint32_t data_sz) {
-    (void)ctx; (void)cpu;
-    const stack_snapshot_event* e = static_cast<const stack_snapshot_event*>(data);
-    if (data_sz < sizeof(stack_snapshot_event)) return;
+// --- Ring Buffer Callback ---
+static int handle_event(void* ctx, void* data, size_t size) {
+    (void)ctx;
+    const stack_sample_event* e = static_cast<const stack_sample_event*>(data);
+    if (size < sizeof(stack_sample_event)) return 0;
 
-    if (e->size == 0) {                       // truly empty snapshot
-        printf("\n--- Sample --- PID:%u TID:%u READ_ERR:%d\n",
-               e->pid, e->tid, e->err);
-        return;
-    }
+    // BEGIN CHANGED CODE – print event header (no raw stack bytes)
+    std::printf(
+        "Event: tgid=%llu pid=%llu sp=0x%llx bp=0x%llx "
+        "size=%u flags=0x%x\n",
+        static_cast<unsigned long long>(e->tgid),
+        static_cast<unsigned long long>(e->pid),
+        static_cast<unsigned long long>(e->sp_remote),
+        static_cast<unsigned long long>(e->bp_remote),      // NEW
+        e->stack_size,
+        e->flags);
+    // END CHANGED CODE
 
     /* ---------- time the unwinder ---------------------------------- */
     auto t0 = std::chrono::high_resolution_clock::now();
 
     std::vector<uint64_t> frames;
     bool truncated = false;
-    UnwindRbpChain(e->data, e->size, e->rsp, e->rbp, frames, truncated);
+    UnwindRbpChain(reinterpret_cast<const uint8_t*>(e->stack),
+                   e->stack_size,
+                   e->sp_remote,
+                   e->bp_remote,          // NEW: initial RBP
+                   frames,
+                   truncated);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                 .count();
 
     /* ------------ print sample ------------------------------------- */
-    printf("\n--- Sample --- PID:%u TID:%u  Frames:%zu  "
+    printf("\n--- Sample --- PID:%llu TID:%llu  Frames:%zu  "
            "stack:%u B  unwind:%ld µs%s\n",
-           e->pid, e->tid, frames.size(),
-           e->size, us,
-           (e->truncated || truncated) ? " (TRUNC)" : "");
+           e->tgid, e->pid, frames.size(),
+           e->stack_size, us,
+           (e->flags & 1 || truncated) ? " (TRUNC)" : "");
 
     for (size_t i = 0; i < frames.size(); ++i)
         printf("    #%zu 0x%llx\n",
                i, (unsigned long long)frames[i]);
-}
 
-static void handle_lost_events(void* ctx, int cpu, long long unsigned int lost_cnt) {
-    (void)ctx;
-    static std::atomic<uint64_t> total_lost(0);
-    total_lost += lost_cnt;
-    fprintf(stderr, "\n### LOST EVENTS ###: Lost %llu events on CPU %d (total lost: %llu)\n",
-        lost_cnt, cpu, (unsigned long long)total_lost.load());
-    fflush(stderr); // Ensure flush
+    return 0;
 }
 
 // --- Main Function ---
@@ -136,8 +139,7 @@ int main(int argc, char** argv) {
     (void)argc; (void)argv; // Silence unused
 
     struct self_profiler_bpf* skel = NULL;
-    struct perf_buffer_opts pb_opts = {};
-    struct perf_buffer* pb = NULL;
+    struct ring_buffer* rb = NULL;
     long sample_freq = 100;
     int err = 0;
     int num_cpus = 0;
@@ -213,20 +215,15 @@ int main(int argc, char** argv) {
     }
     printf("Found events map FD: %d\n", events_map_fd);
 
-    // --- Create Perf Buffer ---
-    printf("Setting up perf buffer...\n");
-    memset(&pb_opts, 0, sizeof(pb_opts));
-    pb_opts.sample_cb = handle_event;
-    pb_opts.lost_cb = handle_lost_events;
-    pb = perf_buffer__new(events_map_fd, 256 /* page count */, &pb_opts);
-    err = libbpf_get_error(pb);
-    if (err) {
-        pb = NULL;
-        fprintf(stderr, "ERROR: Failed to create perf buffer: %s\n", strerror(-err));
-        err = -err;
+    // --- Create Ring Buffer ---
+    printf("Setting up ring buffer...\n");
+    rb = ring_buffer__new(events_map_fd, handle_event, nullptr, nullptr);
+    if (!rb) {
+        fprintf(stderr, "ERROR: Failed to create ring buffer: %s\n", strerror(errno));
+        err = -errno;
         goto cleanup;
     }
-    printf("Perf buffer ready - map populated.\n");
+    printf("Ring buffer ready - map populated.\n");
 
     // --- Open/Attach/Enable SYSTEM-WIDE Sampling Perf Events ---
     printf("Opening/Attaching/Enabling sampling perf events (system-wide)...\n");
@@ -287,24 +284,22 @@ int main(int argc, char** argv) {
     main_workload_thread = std::thread(run_workload, std::ref(keep_running));
 
     // --- Main Event Loop ---
-    printf("Polling perf buffer... Press Ctrl+C to stop.\n");
+    printf("Polling ring buffer... Press Ctrl+C to stop.\n");
     while (!exiting) {
-        err = perf_buffer__poll(pb, 100);
+        err = ring_buffer__poll(rb, 100);
         if (err < 0) {
             if (err == -EINTR) {
                 fprintf(stderr, "\nPolling interrupted by signal (EINTR).\n");
                 // Signal handler already set exiting=true, loop will terminate
-                continue; // Or break; depending on desired immediate exit behavior
+                continue;
             }
-            fprintf(stderr, "\nERROR polling perf buffer: %d (%s)\n", err, strerror(-err));
-            // Consider triggering exit on persistent poll errors?
+            fprintf(stderr, "\nERROR polling ring buffer: %d (%s)\n", err, strerror(-err));
             exiting = true; // Trigger exit on error
             break;
         }
         if (err == 0) { // Timeout
             printf("."); fflush(stdout);
         }
-        // err > 0 => samples processed by callback
     }
 
     printf("\nPolling finished.\n");
@@ -320,8 +315,8 @@ int main(int argc, char** argv) {
 
 cleanup:
     fprintf(stderr, "\nExiting... Performing cleanup.\n"); // Use stderr for exit messages
-    // --- Cleanup --- (Order: perf buffer, links, FDs, skeleton)
-    perf_buffer__free(pb); // Safe to call on NULL
+    // --- Cleanup --- (Order: ring buffer, links, FDs, skeleton)
+    ring_buffer__free(rb); // Safe to call on NULL
 
     if (links) {
         for (int cpu = 0; cpu < num_cpus; ++cpu) {

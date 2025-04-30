@@ -19,104 +19,80 @@ volatile __u32 target_tgid_host = 0;      // host-namespace TGID
 # define PT_REGS_FP PT_REGS_BP
 #endif
 
-#define MAX_STACK_SNAPSHOT 8192
-#define CHUNK 256
-#define MAX_CHUNKS   (MAX_STACK_SNAPSHOT / CHUNK)
-
-// helpers + struct -------------------------------------------------
-struct stack_snapshot_event {
-    __u32 pid;
-    __u32 tid;
-    __u32 size;        /* bytes actually copied                    */
-    __s32 err;         /* bpf_probe_read_user() return value       */
-    __u64 rsp;
-    __u64 rbp;
-    __u8  truncated;
-    __u8  _pad[7];     /* keep 8-byte alignment, header = 40 B     */
-    __u8  data[MAX_STACK_SNAPSHOT];
-};
-
-/* Per-CPU scratch slot big enough for one snapshot.
- * We fill it, then dump through perf_event_output. */
+// ─────────────────────────────────────────────────────────────
+// BEGIN CHANGED CODE – single ring-buffer map
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct stack_snapshot_event);
-} tmp_snapshot SEC(".maps");
-// END CHANGED CODE
-
-// Map to send events to user space
-struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(u32));
-    __uint(value_size, sizeof(u32));
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 23);          /* 8 MiB ring */
 } events SEC(".maps");
+// END CHANGED CODE
+// ─────────────────────────────────────────────────────────────
 
-//static __always_inline bool same_pidns(void)
-//{
-//    struct task_struct* task = (struct task_struct*)bpf_get_current_task();
-//    struct pid_namespace* curr = BPF_CORE_READ(task, nsproxy, pid_ns_for_children);
-//    struct pid_namespace* want = (struct pid_namespace*)(u64)target_pidns;
-//    return curr == want;
-//}
+// ─────────────────────────────────────────────────────────────
+/* BEGIN CHANGED CODE – new event struct  */
+struct stack_sample_event {
+    u64 tgid;
+    u64 pid;
+    u64 time_ns;
+    u64 sp_remote;      /* stack-pointer at sample time          */
+    u64 bp_remote;      /* NEW: frame-pointer (RBP) at sample    */
+    u32 stack_size;    /* real bytes copied, ≤ 8192               */
+    u32 flags;         /* bit 0 = 1 → stack truncated              */
+    char stack[8192];  /* raw bytes – 2 × bpf_copy_from_user()     */
+};
+/* END CHANGED CODE */
+// ─────────────────────────────────────────────────────────────
 
 SEC("perf_event")
 int do_stack_sample(struct bpf_perf_event_data *ctx)
 {
-    /* ---- timing start ---------------------------------------- */
-    __u64 t_start = bpf_ktime_get_ns();
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id;
+    u32 tgid = id >> 32;
 
-    __u32 zero = 0;
-    struct stack_snapshot_event *ev = bpf_map_lookup_elem(&tmp_snapshot, &zero);
-    if (!ev)                      /* should never happen            */
+    struct stack_sample_event *ev;
+    ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+    if (!ev)
         return 0;
 
-    /* fill header -------------------------------------------------- */
-    __u64 id  = bpf_get_current_pid_tgid();
-    __u32 tid = id;
-    __u32 tgid = id >> 32;
+    ev->tgid     = tgid;
+    ev->pid      = pid;
+    ev->time_ns  = bpf_ktime_get_ns();
+    ev->flags    = 0;
+    ev->stack_size = 0;
 
-    ev->pid = tgid;
-    ev->tid = tid;
-    ev->rsp = PT_REGS_SP(&ctx->regs);   /* need address, not value   */
-    ev->rbp = PT_REGS_FP(&ctx->regs);
-    ev->truncated = 0;
-    ev->err = 0;
+    unsigned long sp = PT_REGS_SP(&ctx->regs);
+    unsigned long bp = PT_REGS_FP(&ctx->regs);   // x86-64 RBP
 
-    bpf_printk("sample: rsp=%llx rbp=%llx\n", ev->rsp, ev->rbp);
+    ev->sp_remote = sp;
+    ev->bp_remote = bp;          // NEW
 
-    /* copy loop ----------------------------------------------------- */
-    __u32 copied = 0;
+    // ─────────────────────────────────────────────────────────────
+    // BEGIN CHANGED CODE – count bytes correctly
 
-#pragma unroll
-    for (int i = 0; i < MAX_CHUNKS; i++) {
-        if (copied > MAX_STACK_SNAPSHOT - CHUNK)
-            break;
-
-        int ret = bpf_probe_read_user(ev->data + copied,
-                                      CHUNK,
-                                      (void *)(ev->rsp + copied));
-        if (ret) {
-            ev->truncated = 1;
-            if (copied == 0)
-                ev->err = ret;
-            break;
-        }
-        copied += CHUNK;
+    /* first 4 KiB */
+    int ret = bpf_probe_read_user(ev->stack,
+                                  4096,
+                                  (const void *)sp);
+    if (ret) {                     /* ret < 0 means EFAULT, etc. */
+        bpf_ringbuf_discard(ev, 0);
+        return 0;
     }
+    ev->stack_size = 4096;
 
-    ev->size = copied;          /* already present */
+    /* second 4 KiB */
+    ret = bpf_probe_read_user(ev->stack + 4096,
+                              4096,
+                              (const void *)(sp + 4096));
+    if (ret)                     /* copy failed → truncated flag */
+        ev->flags |= 1;
+    else
+        ev->stack_size += 4096;
 
-    /* ---- timing end  ----------------------------------------- */
-    __u64 delta = bpf_ktime_get_ns() - t_start;
+    // END CHANGED CODE
+    // ─────────────────────────────────────────────────────────────
 
-    /* print elapsed-ns and bytes copied (max 3 printk args)      */
-    bpf_printk("stack_sample: %llu ns  %u B\n", delta, copied);
-
-    /* ship it out -------------------------------------------------- */
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
-                          ev, sizeof(*ev));
+    bpf_ringbuf_submit(ev, 0);
     return 0;
 }
 
