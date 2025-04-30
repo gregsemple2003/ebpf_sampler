@@ -5,7 +5,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include "include/self_profiler_shared.h"
+#include "self_profiler_shared.h"
 
 // ------------------------------------------------------------------
 // BEGIN CHANGED CODE

@@ -33,7 +33,7 @@ struct pid_namespace;  // forward-declare; no header needed
 
 // Generated BPF Skeleton Header
 #include "self_profiler.skel.h"
-#include "include/self_profiler_shared.h"
+#include "self_profiler_shared.h"
 
 // Workload Header
 #include "workload.hpp"

@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
-#include "include/self_profiler_shared.h"
+#include "self_profiler_shared.h"
 
 // BEGIN CHANGED CODE – expose a build-time toggle so you can
 //   `CXXFLAGS+= -DWITH_LIBUNWIND` and link with `-lunwind`
