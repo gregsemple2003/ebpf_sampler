@@ -8,12 +8,11 @@
 #endif
 // END CHANGED CODE
 
-bool UnwindRbpChain(const uint8_t* snap,
-                    uint32_t       snapSz,
-                    uint64_t       snapBase,
-                    uint64_t       rbp,
-                    std::vector<uint64_t>& frames,
-                    bool&          truncated)
+bool UnwindDwarf(const uint8_t* snap,
+                 uint32_t       snapSz,
+                 const regs_x86_64& regs,
+                 std::vector<uint64_t>& frames,
+                 bool&          truncated)
 {
     truncated = false;
     constexpr int kMaxFrames = 128;
@@ -23,15 +22,16 @@ bool UnwindRbpChain(const uint8_t* snap,
     // -------- Attempt DWARF / CFI unwinding via libunwind ----------
     //  We synthesise a minimal ucontext_t containing RIP/RSP/RBP taken
     //  from the snapshot, then ask libunwind to walk using DWARF CFI.
-    uint64_t rip0 = 0;
-    if (snapSz >= 8)
-        std::memcpy(&rip0, snap, sizeof(uint64_t));  // return-addr on stack
-
     ucontext_t uc{};                       // zero-initialised
 #   if defined(__x86_64__)
-    uc.uc_mcontext.gregs[REG_RIP] = rip0;
-    uc.uc_mcontext.gregs[REG_RSP] = snapBase;
-    uc.uc_mcontext.gregs[REG_RBP] = rbp;
+    uc.uc_mcontext.gregs[REG_RIP] = regs.rip;
+    uc.uc_mcontext.gregs[REG_RSP] = regs.rsp;
+    uc.uc_mcontext.gregs[REG_RBP] = regs.rbp;
+    uc.uc_mcontext.gregs[REG_RBX] = regs.rbx;
+    uc.uc_mcontext.gregs[REG_R12] = regs.r12;
+    uc.uc_mcontext.gregs[REG_R13] = regs.r13;
+    uc.uc_mcontext.gregs[REG_R14] = regs.r14;
+    uc.uc_mcontext.gregs[REG_R15] = regs.r15;
 #   else
     // (Other archs need their own register setup.)
 #   endif
@@ -54,13 +54,14 @@ bool UnwindRbpChain(const uint8_t* snap,
 // END CHANGED CODE – DWARF attempt finished; fallback below
 
     auto inSnapshot = [&](uint64_t addr) {
-        return addr >= snapBase && (addr + 8) < snapBase + snapSz;
+        return addr >= regs.rsp && (addr + 8) < regs.rsp + snapSz;
     };
 
     int frameCount = 0;
+    uint64_t rbp = regs.rbp;
     while (inSnapshot(rbp) && frameCount++ < kMaxFrames)
     {
-        uint64_t off = rbp - snapBase;
+        uint64_t off = rbp - regs.rsp;
         uint64_t nextRbp, retAddr;
         std::memcpy(&nextRbp, snap + off,        sizeof(uint64_t));
         std::memcpy(&retAddr, snap + off + 8,    sizeof(uint64_t));

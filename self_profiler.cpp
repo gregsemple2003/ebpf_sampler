@@ -33,13 +33,13 @@ struct pid_namespace;  // forward-declare; no header needed
 
 // Generated BPF Skeleton Header
 #include "self_profiler.skel.h"
+#include "include/self_profiler_shared.h"
 
 // Workload Header
 #include "workload.hpp"
 #include "dwarf_unwind.hpp"
 
-// ------------------------------------------------------------------
-// BEGIN CHANGED CODE – small RAII helpers
+// small RAII helpers
 struct FdGuard {
     int fd = -1;
     ~FdGuard() { if (fd >= 0) close(fd); }
@@ -48,20 +48,6 @@ struct FdGuard {
 using LinkPtr = std::unique_ptr<bpf_link, decltype(&bpf_link__destroy)>;
 using RingPtr = std::unique_ptr<ring_buffer, decltype(&ring_buffer__free)>;
 using SkelPtr = std::unique_ptr<self_profiler_bpf, decltype(&self_profiler_bpf__destroy)>;
-// END CHANGED CODE
-// ------------------------------------------------------------------
-
-// --- BPF Data Structures (Must match BPF side) ---
-struct stack_sample_event {
-    uint64_t tgid;
-    uint64_t pid;
-    uint64_t time_ns;
-    uint64_t sp_remote;
-    uint64_t bp_remote;      // NEW: frame-pointer (RBP) at sample
-    uint32_t stack_size;
-    uint32_t flags;
-    char stack[8192];
-};
 
 // --- Global Variables ---
 static std::atomic<bool> keep_running(true);
@@ -97,42 +83,32 @@ static int bump_memlock_rlimit() {
 static int handle_event(void* ctx, void* data, size_t size) {
     (void)ctx;
     const stack_sample_event* e = static_cast<const stack_sample_event*>(data);
-    if (size < sizeof(stack_sample_event)) return 0;
+    if (size < sizeof(stack_sample_event) || size < sizeof(stack_sample_event) + e->stack_size) return 0;
 
-    // BEGIN CHANGED CODE – print event header (no raw stack bytes)
+    // BEGIN CHANGED CODE – print event header
     std::printf(
-        "Event: tgid=%llu pid=%llu sp=0x%llx bp=0x%llx "
-        "size=%u flags=0x%x\n",
+        "Event: tgid=%llu pid=%llu time=%llu\n",
         static_cast<unsigned long long>(e->tgid),
         static_cast<unsigned long long>(e->pid),
-        static_cast<unsigned long long>(e->sp_remote),
-        static_cast<unsigned long long>(e->bp_remote),      // NEW
-        e->stack_size,
-        e->flags);
+        static_cast<unsigned long long>(e->time_ns));
     // END CHANGED CODE
 
     /* ---------- time the unwinder ---------------------------------- */
     auto t0 = std::chrono::high_resolution_clock::now();
 
     std::vector<uint64_t> frames;
-    bool truncated = false;
-    UnwindRbpChain(reinterpret_cast<const uint8_t*>(e->stack),
-                   e->stack_size,
-                   e->sp_remote,
-                   e->bp_remote,          // NEW: initial RBP
-                   frames,
-                   truncated);
+    bool truncated = e->flags & STACK_TRUNCATED;
+    UnwindDwarf(e->stack, e->stack_size, e->regs, frames, truncated);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                 .count();
 
     /* ------------ print sample ------------------------------------- */
-    printf("\n--- Sample --- PID:%lu TID:%lu  Frames:%zu  "
-           "stack:%u B  unwind:%ld µs%s\n",
+    printf("\n--- Sample --- PID:%llu TID:%llu  Frames:%zu  "
+           "unwind:%ld µs%s\n",
            e->tgid, e->pid, frames.size(),
-           e->stack_size, us,
-           (e->flags & 1 || truncated) ? " (TRUNC)" : "");
+           us, truncated ? " (TRUNC)" : "");
 
     for (size_t i = 0; i < frames.size(); ++i)
         printf("    #%zu 0x%llx\n",
