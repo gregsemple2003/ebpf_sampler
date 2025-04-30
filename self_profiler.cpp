@@ -99,16 +99,27 @@ static void handle_event(void* ctx, int cpu, void* data, uint32_t data_sz) {
         return;
     }
 
+    /* ---------- time the unwinder ---------------------------------- */
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     std::vector<uint64_t> frames;
     bool truncated = false;
     UnwindRbpChain(e->data, e->size, e->rsp, e->rbp, frames, truncated);
 
-    printf("\n--- Sample --- PID:%u TID:%u Frames:%zu%s\n",
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+
+    /* ------------ print sample ------------------------------------- */
+    printf("\n--- Sample --- PID:%u TID:%u  Frames:%zu  "
+           "stack:%u B  unwind:%ld µs%s\n",
            e->pid, e->tid, frames.size(),
-           (e->truncated || truncated) ? " (TRUNCATED)" : "");
+           e->size, us,
+           (e->truncated || truncated) ? " (TRUNC)" : "");
 
     for (size_t i = 0; i < frames.size(); ++i)
-        printf("    #%zu 0x%llx\n", i, (unsigned long long)frames[i]);
+        printf("    #%zu 0x%llx\n",
+               i, (unsigned long long)frames[i]);
 }
 
 static void handle_lost_events(void* ctx, int cpu, long long unsigned int lost_cnt) {

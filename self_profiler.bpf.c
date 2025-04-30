@@ -64,6 +64,9 @@ struct {
 SEC("perf_event")
 int do_stack_sample(struct bpf_perf_event_data *ctx)
 {
+    /* ---- timing start ---------------------------------------- */
+    __u64 t_start = bpf_ktime_get_ns();
+
     __u32 zero = 0;
     struct stack_snapshot_event *ev = bpf_map_lookup_elem(&tmp_snapshot, &zero);
     if (!ev)                      /* should never happen            */
@@ -79,11 +82,8 @@ int do_stack_sample(struct bpf_perf_event_data *ctx)
     ev->rsp = PT_REGS_SP(&ctx->regs);   /* need address, not value   */
     ev->rbp = PT_REGS_FP(&ctx->regs);
     ev->truncated = 0;
+    ev->err = 0;
 
-    ev->err  = 0;        /* clear stale values from previous use */
-    ev->size = 0;
-
-    /* DEBUG ─ print the user-mode RSP/RBP we'll try to copy from */
     bpf_printk("sample: rsp=%llx rbp=%llx\n", ev->rsp, ev->rbp);
 
     /* copy loop ----------------------------------------------------- */
@@ -106,7 +106,13 @@ int do_stack_sample(struct bpf_perf_event_data *ctx)
         copied += CHUNK;
     }
 
-    ev->size = copied;
+    ev->size = copied;          /* already present */
+
+    /* ---- timing end  ----------------------------------------- */
+    __u64 delta = bpf_ktime_get_ns() - t_start;
+
+    /* print elapsed-ns and bytes copied (max 3 printk args)      */
+    bpf_printk("stack_sample: %llu ns  %u B\n", delta, copied);
 
     /* ship it out -------------------------------------------------- */
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
