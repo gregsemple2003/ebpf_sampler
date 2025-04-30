@@ -1,4 +1,4 @@
-﻿// self_profiler.c (Revert perf_event_open pid to getpid())
+﻿// self_profiler.c (Implementing skeleton variable and system-wide events with verbose error logging)
 
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 
@@ -16,7 +16,7 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <stddef.h> // NECESSARY for offsetof
+struct pid_namespace;  // forward-declare; no header needed
 
 // C++ Standard Includes (for workload and threading)
 #include <iostream>
@@ -36,41 +36,30 @@
 // Workload Header
 #include "workload.hpp"
 
-// Stack Unwinder Header
-#include "stack_unwinder.hpp" // NECESSARY include
-
-// --- BPF Data Structures (Must match BPF side EXACTLY) ---
-#define MAX_STACK_BUF_SIZE 8192 // NECESSARY constant
-
-// Event structure received from BPF - Ensure layout matches BPF definition
-struct stack_event {
-    // Metadata
+// --- BPF Data Structures (Must match BPF side) ---
+struct event {
+    uint32_t stack_id;
     uint32_t pid; // TGID
     uint32_t tid; // PID
-    uint32_t stack_size; // Actual size of stack data captured
-    uint8_t truncated;  // Flag: 1 if stack was truncated, 0 otherwise
-    uint8_t __padding[3]; // <<< ADDED explicit padding to match BPF struct alignment calculation
-
-    // Raw stack data (variable length, up to MAX_STACK_BUF_SIZE)
-    // Add alignment attribute to match BPF side
-    unsigned char stack_data[MAX_STACK_BUF_SIZE] __attribute__((aligned(8)));
 };
+#define MAX_STACK_DEPTH 127
 
 // --- Global Variables ---
 static std::atomic<bool> keep_running(true);
 static volatile bool exiting = false;
+static int stack_traces_fd = -1;
 static pid_t target_pid = 0;
 
 // --- Helper: Libbpf Print Function ---
 static int libbpf_print_fn(enum libbpf_print_level level, const char* format, va_list args) {
-    (void)level; // Mark unused explicitly for C++ warnings
+    // Print all libbpf messages for debugging
     fprintf(stderr, "LIBBPF: ");
     return vfprintf(stderr, format, args);
 }
 
 // --- Signal Handler ---
 static void sig_handler(int sig) {
-    fprintf(stderr, "\nCaught signal %d, initiating shutdown...\n", sig);
+    fprintf(stderr, "\nCaught signal %d, initiating shutdown...\n", sig); // Log signal
     exiting = true;
     keep_running.store(false);
 }
@@ -89,75 +78,66 @@ static int bump_memlock_rlimit() {
 // --- Helper: Perf Event Open Syscall ---
 static long perf_event_open_syscall(struct perf_event_attr* hw_event, pid_t pid,
     int cpu, int group_fd, unsigned long flags) {
+    // No logging here, caller handles errors
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
 // --- Perf Buffer Callbacks (Global Functions) ---
 static void handle_event(void* ctx, int cpu, void* data, uint32_t data_sz) {
     (void)ctx; (void)cpu;
+    static uint64_t stack_addrs[MAX_STACK_DEPTH];
 
-    fprintf(stderr, "\n[Callback] handle_event called (data_sz: %u)\n", data_sz);
+    fprintf(stderr, "\n[Callback] handle_event called\n");
 
-    // --- Basic Validation ---
-    size_t min_size = offsetof(struct stack_event, stack_data);
-    if (data_sz < min_size) {
-        fprintf(stderr, "\n[Callback] ERROR: Received event data too small (%u bytes, expected >= %zu bytes calculated with offsetof)\n",
-            data_sz, min_size);
-        return;
+    if (data_sz != sizeof(struct event)) {
+        fprintf(stderr, "\n[Callback] ERROR: Received event data with unexpected size %u (expected: %zu)\n",
+            data_sz, sizeof(struct event));
+        return; // Exit callback on error
     }
 
-    const struct stack_event* e = (const struct stack_event*)data;
+    const struct event* e = (const struct event*)data;
 
-    // --- Detailed Size Validation ---
-    size_t required_data_size = min_size + e->stack_size;
-    if (data_sz < required_data_size) {
-        fprintf(stderr, "\n[Callback] ERROR: Received data_sz %u is smaller than required size %zu (offsetof %zu + stack_size %u). Event is malformed.\n",
-            data_sz, required_data_size, min_size, e->stack_size);
-        return;
-    }
-
-    // Check stack size against our internal buffer capacity (safety)
-    if (e->stack_size > MAX_STACK_BUF_SIZE) {
-        fprintf(stderr, "\n[Callback] ERROR: Received stack_size %u exceeds max static buffer %d.\n",
-            e->stack_size, MAX_STACK_BUF_SIZE);
-        return;
-    }
-
-    // --- Process Event ---
-    printf("\n--- Sample --- PID: %u TID: %u Stack Size: %u bytes ---\n", e->pid, e->tid, e->stack_size);
-
-    // Keep original PID check commented out
-    // if (e->pid != (uint32_t)target_pid) {
+    // BPF program now filters, so PID should always match target_pid
+    // Add a check just in case, but log it as an unexpected error if it fails
+    // TODO gsemple: the tgid received from the kernel != getpid(), likely because its using the process leader PID (or something, we never really figured it out)
+    //if (e->pid != target_pid) {
     //    fprintf(stderr, "\n[Callback] UNEXPECTED ERROR: Received event for wrong PID %u (target %d)\n", e->pid, target_pid);
-    // }
+    //    return; // Don't process unexpected PIDs
+    //}
 
-    if (e->truncated) {
-        fprintf(stderr, "    WARNING: Stack trace was truncated by BPF (captured %u/%d bytes).\n", e->stack_size, MAX_STACK_BUF_SIZE);
+    // Lookup stack trace
+    if (stack_traces_fd < 0) {
+        fprintf(stderr, "\n[Callback] ERROR: stack_traces map FD is not valid (%d)!\n", stack_traces_fd);
+        return; // Exit callback on error
     }
-
-    const unsigned char* stack_data_ptr = e->stack_data;
-
-    // --- Call Unwinder ---
-    std::vector<uint64_t> stack_frames = unwind_stack_frame_pointers(stack_data_ptr, e->stack_size, 0, 0);
-
-    // Print result of unwinding attempt
-    if (!stack_frames.empty()) {
-        printf("  Unwound Stack Trace (Placeholder - Frame Pointers):\n");
-        int count = 0;
-        for (uint64_t addr : stack_frames) {
-            if (addr == 0) continue;
-            printf("    #%d: 0x%" PRIx64 "\n", count++, addr);
+    memset(stack_addrs, 0, sizeof(stack_addrs));
+    int ret = bpf_map_lookup_elem(stack_traces_fd, &e->stack_id, stack_addrs);
+    if (ret != 0) {
+        // Log ENOENT as info, other errors as warning/error
+        if (errno == ENOENT) {
+            fprintf(stderr, "\n[Callback] INFO: Stack ID %u not found (ENOENT) for PID %u.\n", e->stack_id, e->pid);
         }
-        if (count == 0) {
-            printf("    (No frames unwound - likely requires register capture)\n");
+        else {
+            fprintf(stderr, "\n[Callback] ERROR: Failed to lookup stack_id %u for PID %u: %s\n",
+                e->stack_id, e->pid, strerror(errno));
         }
-    }
-    else {
-        printf("  Unwound Stack Trace: (Unwinding failed or not implemented fully yet)\n");
+        return; // Exit callback on error
     }
 
-    fflush(stdout);
-    fflush(stderr);
+    // Print Sample
+    printf("\n--- Sample --- PID: %u TID: %u StackID: %u ---\n", e->pid, e->tid, e->stack_id);
+    printf("  User Stack Trace:\n");
+    int count = 0;
+    for (int i = 0; i < MAX_STACK_DEPTH; ++i) {
+        if (stack_addrs[i] == 0) break;
+        if (stack_addrs[i] > 0x7FFFFFFFFFFFFFFFULL) continue;
+        printf("    #%d: 0x%" PRIx64 "\n", count++, stack_addrs[i]);
+    }
+    if (count == 0) { // Log if lookup succeeded but stack was empty/invalid
+        fprintf(stderr, "    INFO: No valid stack addresses found for stack_id %u\n", e->stack_id);
+    }
+    fflush(stdout); // Ensure printf is flushed
+    fflush(stderr); // Ensure fprintf is flushed
 }
 
 static void handle_lost_events(void* ctx, int cpu, long long unsigned int lost_cnt) {
@@ -166,14 +146,13 @@ static void handle_lost_events(void* ctx, int cpu, long long unsigned int lost_c
     total_lost += lost_cnt;
     fprintf(stderr, "\n### LOST EVENTS ###: Lost %llu events on CPU %d (total lost: %llu)\n",
         lost_cnt, cpu, (unsigned long long)total_lost.load());
-    fflush(stderr);
+    fflush(stderr); // Ensure flush
 }
 
 // --- Main Function ---
 int main(int argc, char** argv) {
-    (void)argc; (void)argv;
+    (void)argc; (void)argv; // Silence unused
 
-    // --- Variable Declarations ---
     struct self_profiler_bpf* skel = NULL;
     struct perf_buffer_opts pb_opts = {};
     struct perf_buffer* pb = NULL;
@@ -185,18 +164,13 @@ int main(int argc, char** argv) {
     std::thread worker_thread;
     std::thread main_workload_thread;
     int events_map_fd = -1;
-    int perf_buffer_page_cnt = 128;
-    struct perf_event_attr attr = {};
-    // pid_t filter_pid = -1; // Removed, will use getpid() directly
-    int group_fd = -1;
-    unsigned long flags = 0;
-    // --- End Variable Declarations ---
+
 
     target_pid = getpid();
     printf("Self Profiler started. PID: %d\n", target_pid);
 
     // --- Basic Setup ---
-    libbpf_set_print(libbpf_print_fn);
+    libbpf_set_print(libbpf_print_fn); // Use verbose libbpf printer
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -208,45 +182,35 @@ int main(int argc, char** argv) {
     skel = self_profiler_bpf__open();
     if (!skel) {
         fprintf(stderr, "ERROR: Failed to open BPF skeleton\n");
-        err = -1;
-        goto cleanup;
+        return 1;
     }
     printf("Skeleton opened.\n");
 
-    // --- Set Target PID Info in Skeleton (Before Load) ---
     printf("Setting target PID in skeleton...\n"); // must happen before load
     {
         struct stat st;
         if (stat("/proc/self/ns/pid", &st) == 0) {
             skel->bss->target_pidns_inum = static_cast<__u32>(st.st_ino);
         }
-        auto host_tgid = [&]() -> __u32 {
+        auto host_tgid = []() -> __u32 {
             FILE* fp = fopen("/proc/self/status", "r");
-            __u32 parsed_tgid = 0;
-            if (fp) {
-                char line[256];
-                while (fgets(line, sizeof(line), fp)) {
-                    if (strncmp(line, "NSpid:", 6) == 0) {
-                        fprintf(stderr, "DEBUG NSpid line = %s", line);
-                        char* ptr = line + 6;
-                        while (*ptr == '\t' || *ptr == ' ') ptr++;
-                        parsed_tgid = static_cast<__u32>(strtoul(ptr, nullptr, 10));
-                        break;
-                    }
-                }
-                fclose(fp);
-            }
-            if (parsed_tgid == 0) {
-                fprintf(stderr, "WARNING: Could not parse NSpid from /proc/self/status. Falling back to getpid().\n");
-                return static_cast<__u32>(target_pid);
-            }
-            return parsed_tgid;
-            }();
-            skel->bss->target_tgid_host = host_tgid;
-            printf("DEBUG: setting target_pidns_inum=%d, target_tgid_host=%d\n",
-                skel->bss->target_pidns_inum, skel->bss->target_tgid_host);
-    }
+            char line[256];
+            while (fp && fgets(line, sizeof(line), fp)) {
+                if (strncmp(line, "NSpid:", 6) == 0) {
+                    fprintf(stderr, "DEBUG NSpid line = %s", line);
 
+                    /* line looks like:  NSpid:\t62620\t62120\n
+                        first number = host pid/tgid              */
+                    return static_cast<__u32>(strtoul(line + 6, nullptr, 10));
+                }
+            }
+            return static_cast<__u32>(getpid());   // fallback: single namespace
+        }();
+
+        skel->bss->target_tgid_host = host_tgid;
+
+        printf("DEBUG: setting target_pidns_inum=%d, target_tgid_host=%d\n", skel->bss->target_pidns_inum, skel->bss->target_tgid_host);
+    }
 
     // --- Load BPF Object ---
     printf("Loading BPF object...\n");
@@ -257,39 +221,40 @@ int main(int argc, char** argv) {
     }
     printf("BPF object loaded.\n");
 
-    // --- Get Map FDs (Events only) ---
-    printf("Finding events map FD...\n");
+    // --- Get Map FDs (Events and Stack Traces) ---
+    printf("Finding map FDs...\n");
     events_map_fd = bpf_map__fd(skel->maps.events);
-    if (events_map_fd < 0) {
-        fprintf(stderr, "ERROR: Failed to get events map FD: %d (%s)\n",
-            events_map_fd, strerror(errno));
+    stack_traces_fd = bpf_map__fd(skel->maps.stack_traces);
+    if (events_map_fd < 0 || stack_traces_fd < 0) {
+        fprintf(stderr, "ERROR: Failed to get map FDs: events=%d, stack_traces=%d (%s)\n",
+            events_map_fd, stack_traces_fd, strerror(errno));
         err = -errno;
         goto cleanup;
     }
-    printf("Found events map FD: %d\n", events_map_fd);
+    printf("Found map FDs: events=%d, stack_traces=%d\n", events_map_fd, stack_traces_fd);
 
     // --- Create Perf Buffer ---
-    printf("Setting up perf buffer (using %d pages)...\n", perf_buffer_page_cnt);
+    printf("Setting up perf buffer...\n");
     memset(&pb_opts, 0, sizeof(pb_opts));
     pb_opts.sample_cb = handle_event;
     pb_opts.lost_cb = handle_lost_events;
-    pb = perf_buffer__new(events_map_fd, perf_buffer_page_cnt, &pb_opts);
+    pb = perf_buffer__new(events_map_fd, 8 /* page count */, &pb_opts);
     err = libbpf_get_error(pb);
     if (err) {
         pb = NULL;
-        fprintf(stderr, "ERROR: Failed to create perf buffer: %d (%s)\n", err, strerror(-err));
+        fprintf(stderr, "ERROR: Failed to create perf buffer: %s\n", strerror(-err));
+        err = -err;
         goto cleanup;
     }
-    printf("Perf buffer ready.\n");
+    printf("Perf buffer ready - map populated.\n");
 
 
-    // --- Open/Attach/Enable Sampling Perf Events ---
-    // Use getpid() as was originally intended in the first provided C file
-    printf("Opening/Attaching/Enabling sampling perf events (PID: %d)...\n", target_pid);
+    // --- Open/Attach/Enable SYSTEM-WIDE Sampling Perf Events ---
+    printf("Opening/Attaching/Enabling sampling perf events (system-wide)...\n");
     num_cpus = libbpf_num_possible_cpus();
     if (num_cpus <= 0) {
         fprintf(stderr, "ERROR: Failed to get number of CPUs: %d\n", num_cpus);
-        err = (num_cpus == 0) ? -ENODEV : num_cpus;
+        err = -1; // Or specific error
         goto cleanup;
     }
 
@@ -300,40 +265,38 @@ int main(int argc, char** argv) {
         err = -ENOMEM;
         goto cleanup;
     }
-    for (int i = 0; i < num_cpus; ++i) pmu_fds[i] = -1;
+    for (int i = 0; i < num_cpus; ++i) pmu_fds[i] = -1; // Initialize
 
-    attr.type = PERF_TYPE_SOFTWARE;
-    attr.size = sizeof(attr);
-    attr.config = PERF_COUNT_SW_CPU_CLOCK;
-    attr.sample_freq = sample_freq;
-    attr.freq = 1;
-    attr.inherit = 1; // Keep original inherit setting
-    attr.exclude_kernel = 1;
-    attr.disabled = 1;
-
-    // Use target_pid (obtained from getpid()) in the perf_event_open call
-    printf("Attaching to SW CPU Clock events (Freq: %ld Hz, PID %d, Inherit: %d)...\n", sample_freq, target_pid, attr.inherit);
     for (int cpu = 0; cpu < num_cpus; cpu++) {
-        // *** REVERTED TO USING target_pid (getpid()) ***
-        pmu_fds[cpu] = perf_event_open_syscall(&attr, target_pid, cpu, group_fd, flags);
+        struct perf_event_attr attr = {};
+        attr.type = PERF_TYPE_SOFTWARE;
+        attr.size = sizeof(attr);
+        attr.config = PERF_COUNT_SW_CPU_CLOCK;
+        attr.sample_freq = sample_freq;
+        attr.freq = 1;
+        attr.inherit = 1;
+        attr.exclude_kernel = 1;
+        attr.disabled = 1; // OPEN DISABLED
+
+        pmu_fds[cpu] = perf_event_open_syscall(&attr, /*pid=*/getpid(), cpu, -1, 0);
         if (pmu_fds[cpu] < 0) {
-            fprintf(stderr, "ERROR: Failed to open perf event for PID %d on CPU %d: %s (errno %d)\n", target_pid, cpu, strerror(errno), errno);
-            if (errno == EPERM) fprintf(stderr, " Check /proc/sys/kernel/perf_event_paranoid setting.\n");
-            else if (errno == ESRCH) fprintf(stderr, " Ensure PID %d exists when event is opened.\n", target_pid);
+            fprintf(stderr, "ERROR: Failed to open system-wide perf event on CPU %d: %s\n", cpu, strerror(errno));
             err = -errno;
             goto cleanup;
         }
 
+        // Attach BPF program to the disabled perf event FD
         links[cpu] = bpf_program__attach_perf_event(skel->progs.do_stack_sample, pmu_fds[cpu]);
-        err = libbpf_get_error(links[cpu]);
-        if (err) {
-            fprintf(stderr, "ERROR: Failed to attach BPF to perf event on CPU %d: %s (err %d)\n", cpu, strerror(-err), err);
+        if (!links[cpu]) {
+            err = -errno;
+            fprintf(stderr, "ERROR: Failed to attach BPF to perf event on CPU %d: %s\n", cpu, strerror(-err));
             goto cleanup;
         }
 
+        // Explicit enable AFTER attach
         if (ioctl(pmu_fds[cpu], PERF_EVENT_IOC_ENABLE, 0) < 0) {
             err = -errno;
-            fprintf(stderr, "ERROR: Failed to enable perf event on CPU %d: %s (errno %d)\n", cpu, strerror(-err), -err);
+            fprintf(stderr, "ERROR: Failed to enable perf event on CPU %d: %s\n", cpu, strerror(-err));
             goto cleanup;
         }
     }
@@ -353,15 +316,18 @@ int main(int argc, char** argv) {
         if (err < 0) {
             if (err == -EINTR) {
                 fprintf(stderr, "\nPolling interrupted by signal (EINTR).\n");
-                continue;
+                // Signal handler already set exiting=true, loop will terminate
+                continue; // Or break; depending on desired immediate exit behavior
             }
             fprintf(stderr, "\nERROR polling perf buffer: %d (%s)\n", err, strerror(-err));
-            exiting = true;
+            // Consider triggering exit on persistent poll errors?
+            exiting = true; // Trigger exit on error
             break;
         }
-        if (err == 0) {
+        if (err == 0) { // Timeout
             printf("."); fflush(stdout);
         }
+        // err > 0 => samples processed by callback
     }
 
     printf("\nPolling finished.\n");
@@ -377,30 +343,32 @@ int main(int argc, char** argv) {
 
 
 cleanup:
-    // --- Cleanup ---
-    fprintf(stderr, "\nExiting... Performing cleanup.\n");
-    perf_buffer__free(pb);
+    fprintf(stderr, "\nExiting... Performing cleanup.\n"); // Use stderr for exit messages
+    // --- Cleanup --- (Order: perf buffer, links, FDs, skeleton)
+    perf_buffer__free(pb); // Safe to call on NULL
 
     if (links) {
         for (int cpu = 0; cpu < num_cpus; ++cpu) {
-            if (links[cpu]) {
-                bpf_link__destroy(links[cpu]);
-            }
+            bpf_link__destroy(links[cpu]); // Safe on NULL
         }
         free(links);
+        fprintf(stderr, "BPF links destroyed.\n");
     }
     if (pmu_fds) {
         for (int cpu = 0; cpu < num_cpus; ++cpu) {
             if (pmu_fds[cpu] >= 0) {
-                ioctl(pmu_fds[cpu], PERF_EVENT_IOC_DISABLE, 0);
+                ioctl(pmu_fds[cpu], PERF_EVENT_IOC_DISABLE, 0); // Best effort disable
                 close(pmu_fds[cpu]);
             }
         }
         free(pmu_fds);
+        fprintf(stderr, "Perf event FDs closed.\n");
     }
 
-    self_profiler_bpf__destroy(skel);
+    self_profiler_bpf__destroy(skel); // Safe to call on NULL
+    fprintf(stderr, "BPF skeleton destroyed.\n");
     fprintf(stderr, "Cleanup complete.\n");
 
+    // Return standardized error code if err was set during init/poll
     return err < 0 ? -err : 0;
 }
