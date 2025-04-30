@@ -128,7 +128,7 @@ static int handle_event(void* ctx, void* data, size_t size) {
                 .count();
 
     /* ------------ print sample ------------------------------------- */
-    printf("\n--- Sample --- PID:%llu TID:%llu  Frames:%zu  "
+    printf("\n--- Sample --- PID:%lu TID:%lu  Frames:%zu  "
            "stack:%u B  unwind:%ld µs%s\n",
            e->tgid, e->pid, frames.size(),
            e->stack_size, us,

@@ -17,10 +17,10 @@ LIBBPF_INCLUDE := /usr/include
 # Add -I. for local headers (like workload.hpp, *.skel.h)
 # Add -pthread for std::thread
 COMMON_FLAGS := -Wall -Wextra -O2 -I.
-CXXFLAGS := -std=c++17 $(COMMON_FLAGS) -pthread -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls
+CXXFLAGS := -std=c++17 $(COMMON_FLAGS) -pthread -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls -DWITH_LIBUNWIND
 CLANG_BPF_FLAGS := -g -O2 -target bpf -Wall -Werror -D__TARGET_ARCH_x86
 # Linker flags
-LDFLAGS := -Wl,-Bstatic -L/usr/src/libbpf/src -lbpf -Wl,-Bdynamic -lelf -lz -pthread
+LDFLAGS := -Wl,-Bstatic -L/usr/src/libbpf/src -lbpf -Wl,-Bdynamic -lelf -lz -pthread -lunwind -lunwind-x86_64
 
 # Source files
 CXX_SRCS := self_profiler.cpp workload.cpp dwarf_unwind.cpp   # All C++ files
