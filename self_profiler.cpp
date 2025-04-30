@@ -16,6 +16,7 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <linux/perf_event.h>
 struct pid_namespace;  // forward-declare; no header needed
 
 // C++ Standard Includes (for workload and threading)
@@ -24,11 +25,11 @@ struct pid_namespace;  // forward-declare; no header needed
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <memory>
 
 // BPF Includes
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
-#include <linux/perf_event.h>
 
 // Generated BPF Skeleton Header
 #include "self_profiler.skel.h"
@@ -36,6 +37,19 @@ struct pid_namespace;  // forward-declare; no header needed
 // Workload Header
 #include "workload.hpp"
 #include "dwarf_unwind.hpp"
+
+// ------------------------------------------------------------------
+// BEGIN CHANGED CODE – small RAII helpers
+struct FdGuard {
+    int fd = -1;
+    ~FdGuard() { if (fd >= 0) close(fd); }
+};
+
+using LinkPtr = std::unique_ptr<bpf_link, decltype(&bpf_link__destroy)>;
+using RingPtr = std::unique_ptr<ring_buffer, decltype(&ring_buffer__free)>;
+using SkelPtr = std::unique_ptr<self_profiler_bpf, decltype(&self_profiler_bpf__destroy)>;
+// END CHANGED CODE
+// ------------------------------------------------------------------
 
 // --- BPF Data Structures (Must match BPF side) ---
 struct stack_sample_event {
@@ -77,13 +91,6 @@ static int bump_memlock_rlimit() {
     }
     printf("Successfully bumped RLIMIT_MEMLOCK.\n");
     return 0;
-}
-
-// --- Helper: Perf Event Open Syscall ---
-static long perf_event_open_syscall(struct perf_event_attr* hw_event, pid_t pid,
-    int cpu, int group_fd, unsigned long flags) {
-    // No logging here, caller handles errors
-    return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
 // --- Ring Buffer Callback ---
@@ -138,15 +145,11 @@ static int handle_event(void* ctx, void* data, size_t size) {
 int main(int argc, char** argv) {
     (void)argc; (void)argv; // Silence unused
 
-    struct self_profiler_bpf* skel = NULL;
-    struct ring_buffer* rb = NULL;
-    long sample_freq = 100;
+    FdGuard               perf_fd;          // replaces int perf_fd
+    LinkPtr               perf_link(nullptr, &bpf_link__destroy);
+    RingPtr               rb      (nullptr, &ring_buffer__free);
+    SkelPtr               skel    (nullptr, &self_profiler_bpf__destroy);
     int err = 0;
-    int num_cpus = 0;
-    int* pmu_fds = NULL;
-    struct bpf_link** links = NULL;
-    std::thread worker_thread;
-    std::thread main_workload_thread;
     int events_map_fd = -1;
 
     target_pid = getpid();
@@ -162,7 +165,7 @@ int main(int argc, char** argv) {
 
     // --- Open BPF Skeleton ---
     printf("Opening BPF skeleton...\n");
-    skel = self_profiler_bpf__open();
+    skel.reset(self_profiler_bpf__open());
     if (!skel) {
         fprintf(stderr, "ERROR: Failed to open BPF skeleton\n");
         return 1;
@@ -197,10 +200,10 @@ int main(int argc, char** argv) {
 
     // --- Load BPF Object ---
     printf("Loading BPF object...\n");
-    err = self_profiler_bpf__load(skel);
+    err = self_profiler_bpf__load(skel.get());
     if (err) {
         fprintf(stderr, "ERROR: Failed to load BPF skeleton: %d (%s)\n", err, strerror(-err));
-        goto cleanup;
+        return 1;
     }
     printf("BPF object loaded.\n");
 
@@ -210,83 +213,61 @@ int main(int argc, char** argv) {
     if (events_map_fd < 0) {
         fprintf(stderr, "ERROR: Failed to get events map FD: %d (%s)\n",
             events_map_fd, strerror(errno));
-        err = -errno;
-        goto cleanup;
+        return 1;
     }
     printf("Found events map FD: %d\n", events_map_fd);
 
     // --- Create Ring Buffer ---
     printf("Setting up ring buffer...\n");
-    rb = ring_buffer__new(events_map_fd, handle_event, nullptr, nullptr);
+    rb.reset(ring_buffer__new(events_map_fd, handle_event, nullptr, nullptr));
     if (!rb) {
         fprintf(stderr, "ERROR: Failed to create ring buffer: %s\n", strerror(errno));
-        err = -errno;
-        goto cleanup;
+        return 1;
     }
     printf("Ring buffer ready - map populated.\n");
 
-    // --- Open/Attach/Enable SYSTEM-WIDE Sampling Perf Events ---
-    printf("Opening/Attaching/Enabling sampling perf events (system-wide)...\n");
-    num_cpus = libbpf_num_possible_cpus();
-    if (num_cpus <= 0) {
-        fprintf(stderr, "ERROR: Failed to get number of CPUs: %d\n", num_cpus);
-        err = -1; // Or specific error
-        goto cleanup;
+    // ─────────────────────────────────────────────────────────────
+    // BEGIN CHANGED CODE – open one "any-CPU" sampling FD
+    struct perf_event_attr attr = {};
+    attr.type          = PERF_TYPE_SOFTWARE;
+    attr.config        = PERF_COUNT_SW_CPU_CLOCK;
+    attr.freq          = 1;
+    attr.sample_freq   = 100;          // keep your old value
+    attr.sample_type   = PERF_SAMPLE_RAW;
+    attr.inherit       = 1;            // follow all threads of this process
+    /* 'disabled' left at 0  → event auto-enables on open */
+
+    perf_fd.fd = syscall(__NR_perf_event_open, &attr,
+                      /*pid=*/getpid(),  /*cpu=*/-1,
+                      /*group_fd=*/-1,   /*flags=*/0);
+    if (perf_fd.fd < 0) {
+        perror("perf_event_open");
+        return 1;
     }
+    // END CHANGED CODE
+    // ─────────────────────────────────────────────────────────────
 
-    pmu_fds = (int*)calloc(num_cpus, sizeof(int));
-    links = (struct bpf_link**)calloc(num_cpus, sizeof(struct bpf_link*));
-    if (!pmu_fds || !links) {
-        fprintf(stderr, "ERROR: Failed to allocate memory for FDs/links\n");
-        err = -ENOMEM;
-        goto cleanup;
+    // ─────────────────────────────────────────────────────────────
+    // BEGIN CHANGED CODE – one bpf_link instead of a vector
+    perf_link.reset(
+        bpf_program__attach_perf_event(skel->progs.do_stack_sample,
+                                       perf_fd.fd));
+    if (!perf_link) {
+        fprintf(stderr, "attach_perf_event failed\n");
+        return 1;
     }
-    for (int i = 0; i < num_cpus; ++i) pmu_fds[i] = -1; // Initialize
-
-    for (int cpu = 0; cpu < num_cpus; cpu++) {
-        struct perf_event_attr attr = {};
-        attr.type = PERF_TYPE_SOFTWARE;
-        attr.size = sizeof(attr);
-        attr.config = PERF_COUNT_SW_CPU_CLOCK;
-        attr.sample_freq = sample_freq;
-        attr.freq = 1;
-        attr.inherit = 1;
-        attr.exclude_kernel = 1;
-        attr.disabled = 1; // OPEN DISABLED
-
-        pmu_fds[cpu] = perf_event_open_syscall(&attr, /*pid=*/getpid(), cpu, -1, 0);
-        if (pmu_fds[cpu] < 0) {
-            fprintf(stderr, "ERROR: Failed to open system-wide perf event on CPU %d: %s\n", cpu, strerror(errno));
-            err = -errno;
-            goto cleanup;
-        }
-
-        // Attach BPF program to the disabled perf event FD
-        links[cpu] = bpf_program__attach_perf_event(skel->progs.do_stack_sample, pmu_fds[cpu]);
-        if (!links[cpu]) {
-            err = -errno;
-            fprintf(stderr, "ERROR: Failed to attach BPF to perf event on CPU %d: %s\n", cpu, strerror(-err));
-            goto cleanup;
-        }
-
-        // Explicit enable AFTER attach
-        if (ioctl(pmu_fds[cpu], PERF_EVENT_IOC_ENABLE, 0) < 0) {
-            err = -errno;
-            fprintf(stderr, "ERROR: Failed to enable perf event on CPU %d: %s\n", cpu, strerror(-err));
-            goto cleanup;
-        }
-    }
-    printf("Sampling perf events opened, attached, and enabled.\n");
+    // END CHANGED CODE
+    // ─────────────────────────────────────────────────────────────
 
     // --- Start Workload Threads ---
     printf("Starting workload threads...\n");
-    worker_thread = std::thread(run_workload, std::ref(keep_running));
-    main_workload_thread = std::thread(run_workload, std::ref(keep_running));
+    std::thread worker_thread(run_workload, std::ref(keep_running));
+    std::thread main_workload_thread(run_workload, std::ref(keep_running));
 
     // --- Main Event Loop ---
     printf("Polling ring buffer... Press Ctrl+C to stop.\n");
     while (!exiting) {
-        err = ring_buffer__poll(rb, 100);
+        err = ring_buffer__poll(rb.get(), 100);
         if (err < 0) {
             if (err == -EINTR) {
                 fprintf(stderr, "\nPolling interrupted by signal (EINTR).\n");
@@ -312,33 +293,6 @@ int main(int argc, char** argv) {
     printf("Main workload thread joined.\n");
     if (worker_thread.joinable()) { worker_thread.join(); }
     printf("Worker thread joined.\n");
-
-cleanup:
-    fprintf(stderr, "\nExiting... Performing cleanup.\n"); // Use stderr for exit messages
-    // --- Cleanup --- (Order: ring buffer, links, FDs, skeleton)
-    ring_buffer__free(rb); // Safe to call on NULL
-
-    if (links) {
-        for (int cpu = 0; cpu < num_cpus; ++cpu) {
-            bpf_link__destroy(links[cpu]); // Safe on NULL
-        }
-        free(links);
-        fprintf(stderr, "BPF links destroyed.\n");
-    }
-    if (pmu_fds) {
-        for (int cpu = 0; cpu < num_cpus; ++cpu) {
-            if (pmu_fds[cpu] >= 0) {
-                ioctl(pmu_fds[cpu], PERF_EVENT_IOC_DISABLE, 0); // Best effort disable
-                close(pmu_fds[cpu]);
-            }
-        }
-        free(pmu_fds);
-        fprintf(stderr, "Perf event FDs closed.\n");
-    }
-
-    self_profiler_bpf__destroy(skel); // Safe to call on NULL
-    fprintf(stderr, "BPF skeleton destroyed.\n");
-    fprintf(stderr, "Cleanup complete.\n");
 
     // Return standardized error code if err was set during init/poll
     return err < 0 ? -err : 0;

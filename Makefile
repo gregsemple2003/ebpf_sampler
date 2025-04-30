@@ -20,7 +20,7 @@ COMMON_FLAGS := -Wall -Wextra -O2 -I.
 CXXFLAGS := -std=c++17 $(COMMON_FLAGS) -pthread -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls
 CLANG_BPF_FLAGS := -g -O2 -target bpf -Wall -Werror -D__TARGET_ARCH_x86
 # Linker flags
-LDFLAGS := -lelf -lz -lbpf
+LDFLAGS := -Wl,-Bstatic -L/usr/src/libbpf/src -lbpf -Wl,-Bdynamic -lelf -lz -pthread
 
 # Source files
 CXX_SRCS := self_profiler.cpp workload.cpp dwarf_unwind.cpp   # All C++ files
